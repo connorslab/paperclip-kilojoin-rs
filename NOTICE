@@ -1,0 +1,11 @@
+Paperclip Kilojoin Rust
+Copyright 2026 Paperclip contributors.
+
+Protocol, round logic, and production test vectors adapted from Kilombino's
+Kilowallet and Kilojoin, Copyright Kilombino contributors, Apache License 2.0.
+https://github.com/Kilombino/kilowallet
+https://github.com/Kilombino/kilojoin
+
+Changes include a Rust port, bounded parsing, transactional event application,
+a durable outbox representation, output-isolation routing hints, and retained
+input reservations after signature release. No upstream endorsement is implied.
