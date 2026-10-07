@@ -74,5 +74,12 @@ of recovery persistence before broadcast. This library implements neither Ark op
 
 ## License and attribution
 
-Apache-2.0. The protocol/state-machine port and fixtures derive from Kilombino's
-Apache-2.0 projects. See [NOTICE](NOTICE) and [LICENSE](LICENSE).
+Paperclip's original code and modifications are released under the **MIT License**.
+See [LICENSE](LICENSE).
+
+The adapted Kilombino portions in `src/crypto.rs`, `src/protocol.rs`, `src/round.rs`
+and the upstream production fixture remain subject to Apache-2.0. Their license
+and notices are retained in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt) and
+[NOTICE](NOTICE). This is not an MIT-only relicensing of upstream code. The package's
+SPDX expression is `MIT AND Apache-2.0`, reflecting both sets of obligations; it is
+not a choice between licenses.

@@ -1,3 +1,5 @@
+// Portions adapted from Kilombino Kilowallet/Kilojoin (Apache-2.0).
+// Modified for Paperclip; Paperclip modifications are MIT. See NOTICE and licenses/.
 //! NIP-01 / NIP-44 v2 wire compatibility. Never expose wallet keys to the relay.
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};

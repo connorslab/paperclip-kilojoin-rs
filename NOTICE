@@ -1,8 +1,10 @@
 Paperclip Kilojoin Rust
 Copyright 2026 Paperclip contributors.
+Paperclip original code and modifications: MIT License (see LICENSE).
 
 Protocol, round logic, and production test vectors adapted from Kilombino's
 Kilowallet and Kilojoin, Copyright Kilombino contributors, Apache License 2.0.
+These upstream portions retain their license; see licenses/Apache-2.0.txt.
 https://github.com/Kilombino/kilowallet
 https://github.com/Kilombino/kilojoin
 

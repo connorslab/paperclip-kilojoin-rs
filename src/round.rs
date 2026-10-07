@@ -1,3 +1,5 @@
+// Portions adapted from Kilombino Kilowallet/Kilojoin (Apache-2.0).
+// Modified for Paperclip; Paperclip modifications are MIT. See NOTICE and licenses/.
 //! Durable round state and outbox. A published signature can never be recalled.
 use super::{
 	crypto::{self, Event},

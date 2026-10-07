@@ -1,3 +1,5 @@
+// Portions adapted from Kilombino Kilowallet/Kilojoin (Apache-2.0).
+// Modified for Paperclip; Paperclip modifications are MIT. See NOTICE and licenses/.
 //! Kilojoin v1 transaction agreement. Relay data is never a signing authority.
 use super::crypto::{self, Event};
 use anyhow::{ensure, Context};
