@@ -1,10 +1,10 @@
 [package]
 name = "paperclip-kilojoin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT AND Apache-2.0"
-description = "Experimental Kilojoin v1 protocol, crypto, and durable round state for the XBT BLAKE2b chain"
+description = "Experimental Kilojoin v1-v4 protocol, crypto, and durable round state for the XBT BLAKE2b chain"
 repository = "https://github.com/connorslab/paperclip-kilojoin-rs"
 readme = "README.md"
 keywords = ["coinjoin", "nostr", "kilojoin", "xbt"]
@@ -17,3 +17,7 @@ bitcoin = { version = "0.32.9", features = ["serde", "rand-std"] }
 chacha20 = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+blind-rsa-signatures = "=0.15.2"
+rsa = "0.8.2"
+derive_more = "=2.0.1"

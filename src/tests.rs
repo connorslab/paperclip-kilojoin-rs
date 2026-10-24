@@ -12,6 +12,11 @@ fn vectors() -> Value {
 }
 fn terms() -> Terms {
 	Terms {
+		script: "p2wpkh".into(),
+		max_inputs: 1,
+		outputs: 1,
+		creator: String::new(),
+		blind_key: String::new(),
 		v: 1,
 		network: "blake2b".into(),
 		id: "0123456789abcdef".into(),
@@ -28,12 +33,16 @@ fn terms() -> Terms {
 }
 fn fixture() -> (Plan, Vec<Seat>, Vec<String>) {
 	let v = vectors();
-	let tx: Transaction = deserialize(&bytes(v["transaction"]["raw_tx"].as_str().unwrap()).unwrap()).unwrap();
+	let tx: Transaction =
+		deserialize(&bytes(v["transaction"]["raw_tx"].as_str().unwrap()).unwrap()).unwrap();
 	let seats = tx
 		.input
 		.iter()
 		.enumerate()
 		.map(|(i, input)| Seat {
+			coins: vec![],
+			join_pub: String::new(),
+			proofs: vec![],
 			token_hash: hex(&[i as u8; 32]),
 			coin: Coin {
 				txid: input.previous_output.txid.to_string(),
@@ -41,7 +50,8 @@ fn fixture() -> (Plan, Vec<Seat>, Vec<String>) {
 				value: if i == 0 { 50000 } else { 60000 },
 				pubkey: hex(input.witness.iter().nth(1).unwrap()),
 			},
-			change_script: v["transaction"]["outputs_in_order"][if i == 0 { 3 } else { 2 }]["script"]
+			change_script: v["transaction"]["outputs_in_order"][if i == 0 { 3 } else { 2 }]
+				["script"]
 				.as_str()
 				.unwrap()
 				.into(),
@@ -65,6 +75,9 @@ fn production_crypto_vectors() {
 	let pool = &v["pool"];
 	let coin: Coin = serde_json::from_value(join["coin"].clone()).unwrap();
 	let seat = Seat {
+		coins: vec![],
+		join_pub: String::new(),
+		proofs: vec![],
 		token_hash: String::new(),
 		coin: coin.clone(),
 		change_script: join["change_script"].as_str().unwrap().into(),
@@ -87,7 +100,10 @@ fn production_crypto_vectors() {
 	let pw = crypto::hash(format!("kilojoin/v1/pw|{}|hunter2", terms().id));
 	assert_eq!(hex(&pw), join["password_key"]);
 	assert_eq!(
-		hex(&crypto::mac(&pw, join["join_pub"].as_str().unwrap().as_bytes())),
+		hex(&crypto::mac(
+			&pw,
+			join["join_pub"].as_str().unwrap().as_bytes()
+		)),
 		join["password_proof"]
 	);
 	assert_eq!(
@@ -104,7 +120,10 @@ fn production_crypto_vectors() {
 	event.verify().unwrap();
 	let plaintext = v["channel_event"]["plaintext"].as_str().unwrap();
 	assert_eq!(crypto::decrypt(&event.content, &cv).unwrap(), plaintext);
-	assert_eq!(crypto::encrypt(plaintext, &cv, &[7; 32]).unwrap(), event.content);
+	assert_eq!(
+		crypto::encrypt(plaintext, &cv, &[7; 32]).unwrap(),
+		event.content
+	);
 	let mut corrupt = event.clone();
 	corrupt.content.push('a');
 	assert!(corrupt.verify().is_err());
@@ -133,8 +152,10 @@ fn production_transaction_vectors_and_rejections() {
 	for (i, name) in ["sig_A", "sig_B"].iter().enumerate() {
 		let sig = t[name].as_str().unwrap();
 		plan.verify(&seats[i].coin.name(), sig).unwrap();
-		tx.input[i].witness =
-			bitcoin::Witness::from_slice(&[bytes(sig).unwrap(), bytes(&seats[i].coin.pubkey).unwrap()]);
+		tx.input[i].witness = bitcoin::Witness::from_slice(&[
+			bytes(sig).unwrap(),
+			bytes(&seats[i].coin.pubkey).unwrap(),
+		]);
 	}
 	assert_eq!(hex(&serialize(&tx)), t["raw_tx"]);
 	assert_eq!(tx.compute_txid().to_string(), t["txid"]);
@@ -161,9 +182,17 @@ fn production_transaction_vectors_and_rejections() {
 }
 fn participant(index: usize) -> Round {
 	let (_, seats, outputs) = fixture();
-	let key = crypto::key(&hex(&crypto::hash(format!("kilojoin vector key {}", index + 1)))).unwrap();
+	let key = crypto::key(&hex(&crypto::hash(format!(
+		"kilojoin vector key {}",
+		index + 1
+	))))
+	.unwrap();
 	Round::new(
 		crate::round::RoundConfig {
+			creator_secret: None,
+			blind_secret: None,
+			extra_coins: vec![],
+			extra_mixes: vec![],
 			terms: terms(),
 			relay: "wss://relay.kilombino.com".into(),
 			tor: true,
@@ -313,4 +342,254 @@ fn kotlin_unpadded_secret_keys_are_accepted_without_relaxing_public_hex() {
 	);
 	assert!(crypto::key("0").is_err());
 	assert!(crypto::key(&"f".repeat(65)).is_err());
+}
+
+fn modern_terms(outputs: usize) -> (Terms, String, String) {
+	static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+	let (public, secret) = KEYS
+		.get_or_init(|| crate::blind::generate().unwrap())
+		.clone();
+	let creator = crypto::secret();
+	let mut t = terms();
+	t.v = if outputs == 1 { 3 } else { 4 };
+	t.outputs = outputs;
+	t.max_inputs = 10;
+	t.creator = crypto::public(&creator).unwrap();
+	t.blind_key = public;
+	(t, creator, secret)
+}
+#[test]
+fn v4_production_fee_mac_and_transaction_vectors() {
+	let v: Value = serde_json::from_str(include_str!("../tests/fixtures/vectors-v4.json")).unwrap();
+	let (t, _, _) = modern_terms(2);
+	assert_eq!(
+		t.fee(false, 1),
+		v["v4"]["fee_share"]["without_change"].as_u64().unwrap()
+	);
+	assert_eq!(t.fee(true, 1), 333);
+	assert_eq!(t.change(50000, 1).unwrap(), 29667);
+	let (_, mut seats, _) = fixture();
+	seats[0].coin.value = 20271;
+	seats[0].change_value = 0;
+	seats[0].change_script.clear();
+	seats[1].coin.value = 50000;
+	seats[1].change_value = 29667;
+	let outputs: Vec<String> = v["v4"]["transaction"]["outputs_in_order"]
+		.as_array()
+		.unwrap()[..4]
+		.iter()
+		.map(|o| o["script"].as_str().unwrap().into())
+		.collect();
+	let plan = Plan::new_many(&t, &seats, &outputs, &seats[0], &outputs[..2]).unwrap();
+	assert_eq!(plan.fee, 604);
+	assert_eq!(
+		plan.tx.compute_txid().to_string(),
+		v["v4"]["transaction"]["txid_before_signing"]
+	);
+	let bl = v["v4"]["mac_blind"]["blinded"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.flat_map(|x| bytes(x.as_str().unwrap()).unwrap())
+		.collect::<Vec<_>>();
+	let digest = hex(&crypto::hash(bl));
+	assert_eq!(
+		protocol::seat_mac(
+			v["v3"]["token"].as_str().unwrap(),
+			&[
+				"blind",
+				v["v4"]["mac_blind"]["round_id"].as_str().unwrap(),
+				&digest
+			]
+		),
+		v["v4"]["mac_blind"]["mac"]
+	);
+	let mut bad = outputs.clone();
+	bad[1] = bad[0].clone();
+	assert!(Plan::new_many(&t, &seats, &bad, &seats[0], &outputs[..2]).is_err());
+}
+fn modern_pair(outputs: usize) -> (Round, Round) {
+	let (t, creator, blind) = modern_terms(outputs);
+	let (_, seats, _) = fixture();
+	let mut rounds = Vec::new();
+	for (i, seat) in seats.iter().enumerate().take(2) {
+		let key = crypto::key(&hex(&crypto::hash(format!(
+			"kilojoin vector key {}",
+			i + 1
+		))))
+		.unwrap();
+		let scripts = (0..outputs)
+			.map(|n| format!("0014{}", hex(&crypto::hash(format!("mix {i}:{n}"))[..20])))
+			.collect::<Vec<_>>();
+		let extra = if i == 1 {
+			let mut c = seat.coin.clone();
+			c.txid = hex(&[3; 32]);
+			c.value = 30000;
+			vec![(c, "extra".into(), key)]
+		} else {
+			vec![]
+		};
+		let r = Round::new(
+			crate::round::RoundConfig {
+				terms: t.clone(),
+				creator_secret: if i == 0 { Some(creator.clone()) } else { None },
+				blind_secret: if i == 0 { Some(blind.clone()) } else { None },
+				extra_coins: extra,
+				extra_mixes: scripts[1..].to_vec(),
+				relay: "wss://test.invalid".into(),
+				tor: true,
+				pool_secret: if i == 0 {
+					Some(vectors()["pool"]["pool_secret"].as_str().unwrap().into())
+				} else {
+					None
+				},
+				coin: seat.coin.clone(),
+				coin_path: "first".into(),
+				mix_script: scripts[0].clone(),
+				change_script: seat.change_script.clone(),
+				password: None,
+			},
+			&key,
+			1791400000,
+		)
+		.unwrap();
+		rounds.push(r);
+	}
+	(rounds.remove(0), rounds.remove(0))
+}
+#[test]
+fn v3_v4_blind_round_restart_multi_input_and_signing() {
+	for count in [1, 2, 4] {
+		let time = 1791400000;
+		let (mut a, mut b) = modern_pair(count);
+		a.start(time).unwrap();
+		b.start(time).unwrap();
+		relay(&mut a, &mut b, time);
+		assert_eq!(b.seats.len(), 2);
+		assert_eq!(b.mine.all_coins().len(), 2);
+		a.request_close(time + 1).unwrap();
+		relay(&mut a, &mut b, time + 1);
+		b.vote(true, time + 2).unwrap();
+		relay(&mut a, &mut b, time + 2);
+		assert_eq!(b.blind_requests.len(), count);
+		assert!(b.blind_requests.iter().all(|r| r.signature.is_some()));
+		b = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+		b.tick(time + 46).unwrap();
+		assert_eq!(b.outbox.iter().filter(|o| o.isolated).count(), count);
+		let authors = b
+			.outbox
+			.iter()
+			.map(|o| o.event.pubkey.clone())
+			.collect::<std::collections::BTreeSet<_>>();
+		assert_eq!(authors.len(), count);
+		relay(&mut a, &mut b, time + 46);
+		assert_eq!(a.phase, "signing");
+		assert_eq!(b.phase, "signing");
+		assert_eq!(a.plan().unwrap().tx, b.plan().unwrap().tx);
+		for (r, index) in [(&mut a, 1), (&mut b, 2)] {
+			let key =
+				crypto::key(&hex(&crypto::hash(format!("kilojoin vector key {index}")))).unwrap();
+			let p = r.plan().unwrap();
+			let sigs = r
+				.mine
+				.all_coins()
+				.iter()
+				.map(|c| p.sign(c, &key).unwrap())
+				.collect();
+			r.signed_messages(sigs, time + 47).unwrap();
+		}
+		relay(&mut a, &mut b, time + 47);
+		assert_eq!(a.signatures.len(), 3);
+		b.tick(time + 2000).unwrap();
+		assert!(b.locked());
+	}
+}
+#[test]
+fn v3_rejects_forged_control_and_unverified_rosters() {
+	let time = 1791400000;
+	let (mut a, mut b) = modern_pair(1);
+	a.start(time).unwrap();
+	b.start(time).unwrap();
+	relay(&mut a, &mut b, time);
+	let forged = Event::message(
+		a.pool_secret.as_ref().unwrap(),
+		&a.terms.public_key,
+		json!({"type":"closing","seats":a.seats,"deadline":time+300,"round_id":"0102030405060708"}),
+		time + 1,
+	)
+	.unwrap();
+	b.handle(&forged, time + 1, true).unwrap();
+	assert_eq!(b.phase, "open");
+	let roster = Event::message(
+		a.creator_secret.as_ref().unwrap(),
+		&a.terms.public_key,
+		json!({"type":"roster","seq":100,"seats":a.seats}),
+		time + 1,
+	)
+	.unwrap();
+	assert!(b.handle(&roster, time + 1, false).is_err());
+	assert!(b.seq < 100);
+}
+#[test]
+fn rfc9474_kotlin_blind_signature_vector() {
+	let v: Value = serde_json::from_str(include_str!("../tests/fixtures/rfc9474.json")).unwrap();
+	let get = |s: &str| v[s].as_str().unwrap().to_owned();
+	let pk = format!("{}:{}", get("N"), get("E"));
+	let request = crate::blind::Request {
+		prefix: get("MSG_PREFIX"),
+		blinded: get("BLINDED_MSG"),
+		inverse: get("INV"),
+		signature: None,
+		at: 0,
+		sent: false,
+	};
+	let sig = crate::blind::finalize(&pk, &get("MSG"), &request, &get("BLIND_SIG")).unwrap();
+	assert_eq!(sig, get("SIG"));
+	crate::blind::verify(&pk, &get("MSG"), &get("MSG_PREFIX"), &sig).unwrap();
+	assert!(crate::blind::verify(&pk, &get("MSG"), &hex(&[0; 32]), &sig).is_err());
+}
+#[test]
+fn legacy_saved_round_keeps_reservation_and_financial_plan() {
+	let r = participant(0);
+	let mut value = serde_json::to_value(&r).unwrap();
+	for key in [
+		"creator_secret",
+		"blind_secret",
+		"round_id",
+		"mixes",
+		"paths",
+		"blind_requests",
+		"blind_answers",
+		"registered_outputs",
+		"last_blind",
+		"last_announcement",
+		"join_proofs",
+	] {
+		value.as_object_mut().unwrap().remove(key);
+	}
+	for key in ["script", "max_inputs", "outputs", "creator", "blind_key"] {
+		value["terms"].as_object_mut().unwrap().remove(key);
+	}
+	for key in ["coins", "join_pub", "proofs"] {
+		value["mine"].as_object_mut().unwrap().remove(key);
+	}
+	value["signed"] = json!(true);
+	value["phase"] = json!("uncertain");
+	let restored: Round = serde_json::from_value(value).unwrap();
+	assert!(restored.locked());
+	assert_eq!(restored.mine.coin, r.mine.coin);
+	assert_eq!(restored.mix_scripts(), vec![r.mix]);
+	assert_eq!(restored.terms.outputs, 1);
+}
+
+#[test]
+fn blind_output_cannot_change_script_or_request_twice() {
+	let time=1791400000;let (mut a,mut b)=modern_pair(2);a.start(time).unwrap();b.start(time).unwrap();relay(&mut a,&mut b,time);
+	a.request_close(time+1).unwrap();relay(&mut a,&mut b,time+1);b.vote(true,time+2).unwrap();relay(&mut a,&mut b,time+2);
+	let req=&b.blind_requests[0];assert!(crate::blind::verify(&b.terms.blind_key,&b.mix_scripts()[1],&req.prefix,req.signature.as_deref().unwrap()).is_err());
+	let requests=b.blind_requests.iter().rev().map(|r|r.blinded.clone()).collect::<Vec<_>>();
+	let digest=hex(&crypto::hash(requests.iter().flat_map(|s|bytes(s).unwrap()).collect::<Vec<_>>()));
+	let m=json!({"type":"blind","round_id":b.round_id,"token_hash":b.mine.token_hash,"blinded":requests,"mac":protocol::seat_mac(&b.token,&["blind",&b.round_id,&digest])});
+	let event=Event::message(b.pool_secret.as_ref().unwrap(),&b.terms.public_key,m,time+3).unwrap();
+	let before=serde_json::to_value(&a).unwrap();assert!(a.handle(&event,time+3,true).is_err());assert_eq!(serde_json::to_value(&a).unwrap(),before);
 }

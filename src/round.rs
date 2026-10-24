@@ -17,6 +17,28 @@ pub struct Outgoing {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Round {
+	#[serde(default)]
+	pub join_proofs: Vec<String>,
+	#[serde(default)]
+	pub creator_secret: Option<String>,
+	#[serde(default)]
+	pub blind_secret: Option<String>,
+	#[serde(default)]
+	pub round_id: String,
+	#[serde(default)]
+	pub mixes: Vec<String>,
+	#[serde(default)]
+	pub paths: Vec<String>,
+	#[serde(default)]
+	pub blind_requests: Vec<crate::blind::Request>,
+	#[serde(default)]
+	pub blind_answers: BTreeMap<String, (Vec<String>, Vec<String>)>,
+	#[serde(default)]
+	pub registered_outputs: BTreeSet<String>,
+	#[serde(default)]
+	pub last_blind: u64,
+	#[serde(default)]
+	pub last_announcement: u64,
 	pub terms: Terms,
 	pub relay: String,
 	pub tor: bool,
@@ -53,6 +75,10 @@ pub struct Round {
 }
 /// Host-selected addresses and connection policy. Never serialize the password.
 pub struct RoundConfig {
+	pub creator_secret: Option<String>,
+	pub blind_secret: Option<String>,
+	pub extra_coins: Vec<(Coin, String, bitcoin::secp256k1::SecretKey)>,
+	pub extra_mixes: Vec<String>,
 	pub terms: Terms,
 	pub relay: String,
 	pub tor: bool,
@@ -74,6 +100,10 @@ impl Round {
 		now: u64,
 	) -> anyhow::Result<Self> {
 		let RoundConfig {
+			creator_secret,
+			blind_secret,
+			extra_coins,
+			extra_mixes,
 			terms,
 			relay,
 			tor,
@@ -99,7 +129,7 @@ impl Round {
 			"wrong coin key"
 		);
 		ensure!(
-			bitcoin::ScriptBuf::from_bytes(crypto::bytes(&mix_script)?).is_p2wpkh(),
+			terms.accepts_script(&bitcoin::ScriptBuf::from_bytes(crypto::bytes(&mix_script)?)),
 			"P2WPKH mixed output required"
 		);
 		ensure!(
@@ -108,10 +138,56 @@ impl Round {
 		);
 		let creator = pool_secret.is_some();
 		if let Some(secret) = &pool_secret {
-			ensure!(crypto::public(secret)? == terms.public_key, "pool key mismatch");
+			ensure!(
+				crypto::public(secret)? == terms.public_key,
+				"pool key mismatch"
+			);
 		}
-		let change_value = protocol::change(coin.value, terms.denomination, terms.fee_rate)?;
-		let mine = Seat {
+		let mut coins = vec![coin.clone()];
+		let mut paths = vec![coin_path.clone()];
+		let mut keys = vec![*coin_key];
+		for (c, p, k) in extra_coins {
+			coins.push(c);
+			paths.push(p);
+			keys.push(k);
+		}
+		ensure!(coins.len() <= terms.max_inputs, "too many inputs");
+		let mut mixes = vec![mix_script.clone()];
+		mixes.extend(extra_mixes);
+		ensure!(
+			mixes.len() == terms.outputs
+				&& mixes.iter().collect::<BTreeSet<_>>().len() == mixes.len(),
+			"invalid mixed outputs"
+		);
+		for m in &mixes {
+			ensure!(
+				terms.accepts_script(&bitcoin::ScriptBuf::from_bytes(crypto::bytes(m)?))
+					&& !coins.iter().any(|c| c
+						.script_for(&terms.script)
+						.is_ok_and(|s| s.to_hex_string() == *m)),
+				"invalid or reused mixed output"
+			);
+		}
+		if terms.v >= 3 && creator {
+			ensure!(
+				creator_secret
+					.as_ref()
+					.map(|s| crypto::public(s))
+					.transpose()?
+					.as_ref() == Some(&terms.creator)
+					&& blind_secret.is_some(),
+				"missing creator keys"
+			);
+		}
+		let change_value = terms.change(coins.iter().map(|c| c.value).sum(), coins.len())?;
+		let mut mine = Seat {
+			coins: if coins.len() > 1 {
+				coins.clone()
+			} else {
+				vec![]
+			},
+			join_pub: String::new(),
+			proofs: vec![],
 			token_hash: String::new(),
 			coin,
 			change_script: if change_value > 0 {
@@ -123,7 +199,8 @@ impl Round {
 		};
 		mine.validate(&terms)?;
 		ensure!(
-			mine.change_script != mix_script && mine.change_script != mine.coin.script()?.to_hex_string(),
+			mine.change_script != mix_script
+				&& mine.change_script != mine.coin.script()?.to_hex_string(),
 			"fresh change address required"
 		);
 		let join_secret = crypto::secret();
@@ -132,7 +209,29 @@ impl Round {
 		} else {
 			crypto::public(&join_secret)?
 		};
-		let proof = protocol::proof(coin_key, protocol::ownership(&terms.id, &joinpub, &mine.coin));
+		let proofs = coins
+			.iter()
+			.zip(keys.iter())
+			.map(|(c, k)| {
+				ensure!(
+					c.key()?.inner
+						== bitcoin::secp256k1::PublicKey::from_secret_key(
+							&bitcoin::secp256k1::Secp256k1::new(),
+							k
+						),
+					"coin key mismatch"
+				);
+				Ok(protocol::proof(
+					k,
+					protocol::ownership(&terms.id, &joinpub, c),
+				))
+			})
+			.collect::<anyhow::Result<Vec<_>>>()?;
+		let proof = proofs[0].clone();
+		if terms.v >= 3 {
+			mine.join_pub = joinpub.clone();
+			mine.proofs = proofs.clone();
+		}
 		let change_sig = protocol::proof(coin_key, protocol::change_hash(&terms.id, &mine));
 		let pw = if terms.private {
 			let password = password.context("private pool password required")?;
@@ -140,11 +239,25 @@ impl Round {
 				!password.is_empty() && password.len() <= 256,
 				"password length out of range"
 			);
-			Some(crypto::hash(format!("kilojoin/v1/pw|{}|{password}", terms.id)))
+			Some(crypto::hash(format!(
+				"kilojoin/v1/pw|{}|{password}",
+				terms.id
+			)))
 		} else {
 			None
 		};
 		Ok(Self {
+			join_proofs: proofs,
+			creator_secret,
+			blind_secret,
+			round_id: String::new(),
+			mixes,
+			paths,
+			blind_requests: vec![],
+			blind_answers: BTreeMap::new(),
+			registered_outputs: BTreeSet::new(),
+			last_blind: 0,
+			last_announcement: now,
 			terms,
 			relay,
 			tor,
@@ -189,6 +302,20 @@ impl Round {
 		})
 	}
 
+	pub fn mix_scripts(&self) -> Vec<String> {
+		if self.mixes.is_empty() {
+			vec![self.mix.clone()]
+		} else {
+			self.mixes.clone()
+		}
+	}
+	pub fn coin_paths(&self) -> Vec<String> {
+		if self.paths.is_empty() {
+			vec![self.path.clone()]
+		} else {
+			self.paths.clone()
+		}
+	}
 	pub fn terminal(&self) -> bool {
 		["confirmed", "aborted", "rejected"].contains(&self.phase.as_str())
 	}
@@ -196,22 +323,41 @@ impl Round {
 		!self.terminal() || (self.signed && self.phase != "confirmed")
 	}
 	pub fn plan(&self) -> anyhow::Result<Plan> {
-		Plan::new(
+		Plan::new_many(
 			&self.terms,
 			&self.round,
 			&self.outputs.iter().cloned().collect::<Vec<_>>(),
 			&self.mine,
-			&self.mix,
+			&self.mix_scripts(),
 		)
 	}
-	fn enqueue(&mut self, e: Event, isolated: bool) -> anyhow::Result<()> {
-		ensure!(self.outbox.len() < 128, "relay outbox full; reconnect first");
+	pub(crate) fn enqueue(&mut self, e: Event, isolated: bool) -> anyhow::Result<()> {
+		ensure!(
+			self.outbox.len() < 128,
+			"relay outbox full; reconnect first"
+		);
 		self.outbox.push(Outgoing { event: e, isolated });
 		Ok(())
 	}
-	fn channel(&mut self, value: Value, now: u64) -> anyhow::Result<()> {
+	pub(crate) fn channel(&mut self, value: Value, now: u64) -> anyhow::Result<()> {
 		let e = Event::message(
-			self.pool_secret.as_deref().context("not welcomed")?,
+			if self.terms.v >= 3
+				&& [
+					"roster",
+					"vote_open",
+					"reopen",
+					"closing",
+					"blind_sig",
+					"outputs",
+				]
+				.contains(&value["type"].as_str().unwrap_or(""))
+			{
+				self.creator_secret
+					.as_deref()
+					.context("creator key required")?
+			} else {
+				self.pool_secret.as_deref().context("not welcomed")?
+			},
 			&self.terms.public_key,
 			value.clone(),
 			now,
@@ -246,7 +392,10 @@ impl Round {
 	}
 	fn roster(&mut self, now: u64) -> anyhow::Result<()> {
 		self.seq = self.seq.checked_add(1).context("sequence overflow")?;
-		self.channel(json!({"type":"roster","seq":self.seq,"seats":self.seats}), now)?;
+		self.channel(
+			json!({"type":"roster","seq":self.seq,"seats":self.seats}),
+			now,
+		)?;
 		self.announce(now)
 	}
 	pub fn start(&mut self, now: u64) -> anyhow::Result<()> {
@@ -260,7 +409,7 @@ impl Round {
 			let e = Event::message(
 				&self.join_secret,
 				&self.terms.public_key,
-				json!({"type":"join","seat":self.mine,"proof":self.proof,"change_sig":self.change_sig,"pw":self.password_proof}),
+				json!({"type":"join","seat":self.mine,"proof":self.proof,"proofs":if self.join_proofs.is_empty() { vec![self.proof.clone()] } else { self.join_proofs.clone() },"change_sig":self.change_sig,"pw":self.password_proof}),
 				now,
 			)?;
 			self.enqueue(e, false)
@@ -273,8 +422,15 @@ impl Round {
 			"unrelated event"
 		);
 		let join = crypto::public(&self.join_secret)?;
-		let secret = if e.tag("p") == Some(join.as_str()) && e.pubkey == self.terms.public_key {
+		let secret = if e.tag("p") == Some(join.as_str()) && e.pubkey == self.reply_public() {
 			&self.join_secret
+		} else if self.creator
+			&& self.terms.v >= 3
+			&& e.tag("p") == Some(self.terms.creator.as_str())
+		{
+			self.creator_secret
+				.as_ref()
+				.context("missing creator key")?
 		} else if e.tag("p") == Some(self.terms.public_key.as_str()) {
 			self.pool_secret.as_ref().context("not welcomed")?
 		} else {
@@ -285,14 +441,17 @@ impl Round {
 			&crypto::conversation(secret, &e.pubkey)?,
 		)?)?)
 	}
-	fn validate_seats(&self, seats: &[Seat]) -> anyhow::Result<()> {
+	pub(crate) fn validate_seats(&self, seats: &[Seat]) -> anyhow::Result<()> {
 		ensure!(seats.len() <= self.terms.max_peers, "too many seats");
 		let mut names = BTreeSet::new();
 		let mut tokens = BTreeSet::new();
 		for s in seats {
 			s.validate(&self.terms)?;
+			if self.terms.v >= 3 {
+				s.check_proofs(&self.terms)?;
+			}
 			ensure!(
-				names.insert(s.coin.name())
+				s.all_coins().iter().all(|c| names.insert(c.name()))
 					&& crypto::bytes(&s.token_hash)?.len() == 32
 					&& tokens.insert(&s.token_hash),
 				"duplicate or invalid seat"
@@ -316,10 +475,20 @@ impl Round {
 		let joinpub = crypto::public(&self.join_secret)?;
 		let typ = m["type"].as_str().unwrap_or("");
 		if e.tag("p") == Some(joinpub.as_str()) {
-			if self.phase == "joining" && e.pubkey == self.terms.public_key {
+			if self.phase == "joining" && e.pubkey == self.reply_public() {
 				if typ == "welcome" {
-					let secret = m["pool_secret"].as_str().context("missing pool key")?;
-					ensure!(crypto::public(secret)? == self.terms.public_key, "wrong pool key");
+					let raw = m["pool_secret"].as_str().context("missing pool key")?;
+					ensure!(
+						!raw.is_empty()
+							&& raw.len() <= 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()),
+						"invalid pool key"
+					);
+					let padded = format!("{raw:0>64}");
+					let secret = padded.as_str();
+					ensure!(
+						crypto::public(secret)? == self.terms.public_key,
+						"wrong pool key"
+					);
 					let token = m["token"].as_str().context("missing token")?;
 					ensure!(crypto::bytes(token)?.len() == 16, "invalid token");
 					self.pool_secret = Some(secret.into());
@@ -332,10 +501,38 @@ impl Round {
 					self.reason = "Pool rejected the join request.".into();
 				}
 			}
+		} else if self.terms.v >= 3
+			&& typ == "output"
+			&& self.creator
+			&& e.tag("p") == Some(self.terms.creator.as_str())
+		{
+			self.receive_blind_output(&m, now)?;
+		} else if self.terms.v >= 3
+			&& e.pubkey == self.terms.creator
+			&& e.tag("p") == Some(self.terms.public_key.as_str())
+		{
+			ensure!(
+				[
+					"roster",
+					"vote_open",
+					"reopen",
+					"closing",
+					"blind_sig",
+					"outputs"
+				]
+				.contains(&typ),
+				"unexpected creator message"
+			);
+			if ["roster", "closing"].contains(&typ) {
+				ensure!(unspent, "roster inputs not verified");
+			}
+			self.modern_message(&m, e.created_at, now)?;
 		} else if e.pubkey != self.terms.public_key {
 			if self.creator && typ == "join" {
 				self.join(e, &m, now, unspent)?;
 			}
+		} else if self.terms.v >= 3 {
+			self.member_message(&m, e.created_at, now)?;
 		} else {
 			self.channel_message(&m, e.created_at, now)?;
 		}
@@ -348,27 +545,44 @@ impl Round {
 		}
 		let check = (|| -> anyhow::Result<Seat> {
 			ensure!(
-				self.phase == "open" && now <= self.terms.timeout && self.seats.len() < self.terms.max_peers,
+				self.phase == "open"
+					&& now <= self.terms.timeout
+					&& self.seats.len() < self.terms.max_peers,
 				"pool no longer open"
 			);
 			if let Some(k) = &self.password_key {
 				ensure!(
 					m["pw"].as_str()
-						== Some(crypto::hex(&crypto::mac(&crypto::bytes(k)?, e.pubkey.as_bytes())).as_str()),
+						== Some(
+							crypto::hex(&crypto::mac(&crypto::bytes(k)?, e.pubkey.as_bytes()))
+								.as_str()
+						),
 					"incorrect password"
 				);
 			}
-			let seat: Seat = serde_json::from_value(m["seat"].clone())?;
+			let mut seat: Seat = serde_json::from_value(m["seat"].clone())?;
 			seat.validate(&self.terms)?;
 			ensure!(
-				!self.seats.iter().any(|s| s.coin.name() == seat.coin.name()),
+				!self.seats.iter().any(|s| s
+					.all_coins()
+					.iter()
+					.any(|a| seat.all_coins().iter().any(|b| a.name() == b.name()))),
 				"coin already registered"
 			);
-			protocol::verify_proof(
-				&seat.coin,
-				protocol::ownership(&self.terms.id, &e.pubkey, &seat.coin),
-				m["proof"].as_str().context("missing proof")?,
-			)?;
+			let proofs: Vec<String> = if seat.all_coins().len() == 1
+				&& m["proofs"].as_array().is_none_or(|a| a.is_empty())
+			{
+				vec![m["proof"].as_str().context("missing proof")?.into()]
+			} else {
+				serde_json::from_value(m["proofs"].clone())?
+			};
+			seat.join_pub = e.pubkey.clone();
+			seat.proofs = proofs;
+			seat.check_proofs(&self.terms)?;
+			if self.terms.v < 3 {
+				seat.join_pub.clear();
+				seat.proofs.clear();
+			}
 			protocol::verify_proof(
 				&seat.coin,
 				protocol::change_hash(&self.terms.id, &seat),
@@ -381,7 +595,7 @@ impl Round {
 			Ok(s) => s,
 			Err(_) => {
 				let event = Event::message(
-					self.pool_secret.as_deref().context("missing pool key")?,
+					self.reply_secret()?,
 					&e.pubkey,
 					json!({"type":"reject","reason":"Join validation failed or pool unavailable"}),
 					now,
@@ -395,7 +609,7 @@ impl Round {
 		self.joins.insert(e.pubkey.clone(), token.clone());
 		// Welcome precedes the roster. Replaying the channel after welcome covers relay order.
 		let welcome = Event::message(
-			self.pool_secret.as_deref().context("missing pool key")?,
+			self.reply_secret()?,
 			&e.pubkey,
 			json!({"type":"welcome","pool_secret":self.pool_secret,"token":token,"seq":self.seq+1}),
 			now,
@@ -408,9 +622,9 @@ impl Round {
 		Ok(())
 	}
 	fn closing(&mut self, seats: Vec<Seat>, now: u64) -> anyhow::Result<()> {
-		self.channel(json!({"type":"closing","seats":seats,"deadline":now+300}), now)
+		self.channel(json!({"type":"closing","seats":seats,"deadline":now+300,"round_id":crypto::hex(&crypto::random(8))}), now)
 	}
-	fn channel_message(&mut self, m: &Value, at: u64, now: u64) -> anyhow::Result<()> {
+	pub(crate) fn channel_message(&mut self, m: &Value, at: u64, now: u64) -> anyhow::Result<()> {
 		match m["type"].as_str().unwrap_or("") {
 			"roster" if !self.creator && ["open", "voting"].contains(&self.phase.as_str()) => {
 				let seq = m["seq"].as_u64().context("invalid sequence")?;
@@ -424,9 +638,18 @@ impl Round {
 					}
 				}
 			}
-			"close_request" if self.phase == "open" && self.seats.len() >= self.terms.min_peers => {
-				let th = protocol::token_hash(m["token"].as_str().context("missing token")?);
-				ensure!(self.seats.iter().any(|s| s.token_hash == th), "unknown voter");
+			"close_request" | "vote_open"
+				if self.phase == "open" && self.seats.len() >= self.terms.min_peers =>
+			{
+				let th = if self.terms.v >= 3 {
+					m["by"].as_str().context("missing voter")?.into()
+				} else {
+					protocol::token_hash(m["token"].as_str().context("missing token")?)
+				};
+				ensure!(
+					self.seats.iter().any(|s| s.token_hash == th),
+					"unknown voter"
+				);
 				let vote = m["vote_id"].as_str().context("missing vote")?;
 				ensure!(crypto::bytes(vote)?.len() == 8, "invalid vote");
 				self.phase = "voting".into();
@@ -437,10 +660,17 @@ impl Round {
 			}
 			"vote" if self.creator && self.phase == "voting" && m["vote_id"] == self.vote => {
 				let th = protocol::token_hash(m["token"].as_str().context("missing token")?);
-				ensure!(self.seats.iter().any(|s| s.token_hash == th), "unknown voter");
+				ensure!(
+					self.seats.iter().any(|s| s.token_hash == th),
+					"unknown voter"
+				);
 				if m["accept"].as_bool() == Some(true) {
 					self.accepts.insert(th);
-					if self.seats.iter().all(|s| self.accepts.contains(&s.token_hash)) {
+					if self
+						.seats
+						.iter()
+						.all(|s| self.accepts.contains(&s.token_hash))
+					{
 						self.closing(self.seats.clone(), now)?;
 					}
 				} else {
@@ -469,7 +699,10 @@ impl Round {
 				self.round = seats;
 				self.phase = "closing".into();
 				self.deadline = deadline;
-				self.output_at = now + 3 + (crypto::random(1)[0] as u64 % 40);
+				self.output_at = now + 3 + (crypto::random(1)[0] as u64 % 41);
+				if self.terms.v >= 3 {
+					self.begin_blinding(m, now)?;
+				}
 			}
 			"output" if self.phase == "closing" => {
 				let script = m["script"].as_str().context("missing script")?;
@@ -509,12 +742,14 @@ impl Round {
 					self.channel(json!({"type":"reopen","vote_id":self.vote}), now)?;
 				}
 			}
-			"abort" if self.phase != "broadcast" => self.abort_local("A participant aborted the round"),
+			"abort" if self.phase != "broadcast" => {
+				self.abort_local("A participant aborted the round")
+			}
 			_ => {}
 		}
 		Ok(())
 	}
-	fn abort_local(&mut self, reason: &str) {
+	pub(crate) fn abort_local(&mut self, reason: &str) {
 		self.phase = if self.signed { "uncertain" } else { "aborted" }.into();
 		self.reason = reason.into();
 	}
@@ -523,13 +758,22 @@ impl Round {
 			self.phase == "open" && self.seats.len() >= self.terms.min_peers,
 			"not enough participants"
 		);
+		if self.terms.v >= 3 {
+			return self.modern_close(now);
+		}
 		self.channel(
 			json!({"type":"close_request","token":self.token,"vote_id":crypto::hex(&crypto::random(8))}),
 			now,
 		)
 	}
 	pub fn vote(&mut self, accept: bool, now: u64) -> anyhow::Result<()> {
-		ensure!(self.phase == "voting" && self.voted != self.vote, "no new vote");
+		ensure!(
+			self.phase == "voting" && self.voted != self.vote,
+			"no new vote"
+		);
+		if self.terms.v >= 3 {
+			return self.modern_vote(accept, now);
+		}
 		self.channel(
 			json!({"type":"vote","token":self.token,"vote_id":self.vote,"accept":accept}),
 			now,
@@ -549,9 +793,9 @@ impl Round {
 			self.channel(
 				if self.creator {
 					json!({"type":"abort","reason":"Creator left"})
-				} else {
-					json!({"type":"leave","token":self.token})
-				},
+				} else if self.terms.v >= 3 {
+					json!({"type":"leave","token_hash":self.mine.token_hash,"mac":protocol::seat_mac(&self.token,&["leave"])})
+				} else { json!({"type":"leave","token":self.token}) },
 				now,
 			)?;
 		}
@@ -573,8 +817,9 @@ impl Round {
 			if yes.len() >= self.terms.min_peers {
 				self.closing(yes, now)?;
 			} else {
-				self.seats
-					.retain(|s| self.accepts.contains(&s.token_hash) || s.token_hash == self.mine.token_hash);
+				self.seats.retain(|s| {
+					self.accepts.contains(&s.token_hash) || s.token_hash == self.mine.token_hash
+				});
 				self.roster(now)?;
 				self.channel(json!({"type":"reopen","vote_id":self.vote}), now)?;
 			}
@@ -582,24 +827,40 @@ impl Round {
 		if ["closing", "signing"].contains(&self.phase.as_str()) && now > self.deadline + 60 {
 			self.abort_local("Round timed out");
 		}
-		if self.phase == "closing" && !self.output_sent && now >= self.output_at {
+		if self.terms.v >= 3 {
+			self.modern_tick(now)?;
+		}
+		if self.terms.v < 3 && self.phase == "closing" && !self.output_sent && now >= self.output_at
+		{
 			self.channel(json!({"type":"output","script":self.mix}), now)?;
 			self.output_sent = true;
 		}
 		Ok(())
 	}
 	pub fn signed_message(&mut self, sig: String, now: u64) -> anyhow::Result<()> {
+		self.signed_messages(vec![sig], now)
+	}
+	pub fn signed_messages(&mut self, signatures: Vec<String>, now: u64) -> anyhow::Result<()> {
 		ensure!(
 			self.phase == "signing" && !self.signed && now <= self.deadline,
 			"round is not ready for signing"
 		);
-		self.plan()?.verify(&self.mine.coin.name(), &sig)?;
-		self.channel(
-			json!({"type":"sig","outpoint":self.mine.coin.name(),"sig":sig}),
-			now,
-		)?;
-		self.signatures.insert(self.mine.coin.name(), sig);
+		ensure!(
+			signatures.len() == self.mine.all_coins().len(),
+			"missing own signatures"
+		);
+		let plan = self.plan()?;
+		for (c, sig) in self.mine.all_coins().iter().zip(&signatures) {
+			plan.verify(&c.name(), sig)?;
+		}
+		let own = self.mine.all_coins().to_vec();
+		for (c, sig) in own.iter().zip(signatures) {
+			self.channel(json!({"type":"sig","outpoint":c.name(),"sig":sig}), now)?;
+			self.signatures.insert(c.name(), sig);
+		}
 		self.signed = true;
 		Ok(())
 	}
 }
+
+include!("round_modern.rs");
