@@ -593,3 +593,15 @@ fn blind_output_cannot_change_script_or_request_twice() {
 	let event=Event::message(b.pool_secret.as_ref().unwrap(),&b.terms.public_key,m,time+3).unwrap();
 	let before=serde_json::to_value(&a).unwrap();assert!(a.handle(&event,time+3,true).is_err());assert_eq!(serde_json::to_value(&a).unwrap(),before);
 }
+
+#[test]
+fn taproot_unified_sighash_commits_to_absent_annex() {
+	let key=crypto::key(&hex(&[1;32])).unwrap();let secp=bitcoin::secp256k1::Secp256k1::new();
+	let mut t=terms();t.v=2;t.script="p2tr".into();t.max_inputs=10;
+	let script=|n:u8| {let k=crypto::key(&hex(&[n;32])).unwrap();bitcoin::ScriptBuf::new_p2tr(&secp,bitcoin::secp256k1::PublicKey::from_secret_key(&secp,&k).x_only_public_key().0,None).to_hex_string()};
+	let mut seats=Vec::new();let mut outputs=Vec::new();
+	for n in [2,3] {seats.push(Seat {coins:vec![],join_pub:String::new(),proofs:vec![],token_hash:hex(&[n;32]),coin:Coin {txid:hex(&[n;32]),vout:0,value:50000,pubkey:bitcoin::secp256k1::PublicKey::from_secret_key(&secp,&key).to_string()},change_script:script(n+4),change_value:t.change(50000,1).unwrap()});outputs.push(script(n+2));}
+	let p=Plan::new(&t,&seats,&outputs,&seats[0],&outputs[0]).unwrap();
+	assert_eq!(hex(&p.digest(0).unwrap()),"95177d77378b7e874423067b397f43b81cc294f1b7576166584c50016d6ab39a");
+	let signature=p.sign(&seats[0].coin,&key).unwrap();p.verify(&seats[0].coin.name(),&signature).unwrap();assert_eq!(signature.len(),130);
+}

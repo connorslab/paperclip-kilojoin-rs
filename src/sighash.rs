@@ -1,4 +1,4 @@
-//! Kilojoin v1's P2WPKH unified SIGHASH_ALL (0x21), not Bitcoin's legacy BIP143 digest.
+//! Kilojoin unified SIGHASH_ALL (0x21) for native SegWit and Taproot key-path inputs.
 //! The extra zero after locktime is part of the fork's five-byte locktime encoding.
 use anyhow::{ensure, Context};
 use bitcoin::{
@@ -58,6 +58,7 @@ pub fn unified_all(
 	if let Some(script) = script {
 		msg.extend(serialize(&script));
 	}
+	if taproot { msg.push(0); } // Explicit no-annex execution field.
 	let tag = sha256::Hash::hash(b"UnifiedSighash").to_byte_array();
 	let mut tagged = tag.to_vec();
 	tagged.extend(tag);
