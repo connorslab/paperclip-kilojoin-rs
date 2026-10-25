@@ -83,7 +83,7 @@ impl Terms {
 			"invalid pool identity"
 		);
 		ensure!(
-			(10000..=100000000).contains(&self.denomination)
+			(1000..=100000000).contains(&self.denomination)
 				&& self.fee_rate.is_finite()
 				&& (1.0..=500.0).contains(&self.fee_rate),
 			"pool amount or rate out of range"

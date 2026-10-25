@@ -605,3 +605,21 @@ fn taproot_unified_sighash_commits_to_absent_annex() {
 	assert_eq!(hex(&p.digest(0).unwrap()),"95177d77378b7e874423067b397f43b81cc294f1b7576166584c50016d6ab39a");
 	let signature=p.sign(&seats[0].coin,&key).unwrap();p.verify(&seats[0].coin.name(),&signature).unwrap();assert_eq!(signature.len(),130);
 }
+
+#[test]
+fn small_mixed_outputs_follow_protocol_amount_floor() {
+	let (mut t, _, _) = modern_terms(5);
+	t.denomination = 2_000;
+	t.validate().unwrap();
+	assert_eq!(t.mix_total(), 10_000);
+	t.denomination = 1_000;
+	t.validate().unwrap(); // Valid test pool; production hosts filter totals below 10,000.
+	assert_eq!(t.mix_total(), 5_000);
+	t.denomination = 999;
+	assert!(t.validate().is_err());
+	t.denomination = 100_000_001;
+	assert!(t.validate().is_err());
+	t.denomination = 2_000;
+	t.outputs = usize::MAX;
+	assert!(t.validate().is_err());
+}
